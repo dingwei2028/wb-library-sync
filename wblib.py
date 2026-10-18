@@ -1318,10 +1318,19 @@ def push_via_doc(token: str, path: Path, space_id: str, parent_id: str,
 
 
 def build_push_plan(token: str, files: List[Path], space_id: str,
-                    parent_id: str) -> List[Dict[str, Any]]:
+                    parent_id: str, root: Optional[Path] = None) -> List[Dict[str, Any]]:
     """逐个文件判定：上传 / 云端已有（跳过）/ 不能传（跳过）。"""
     index = remote_name_index(token, space_id, parent_id)
     seen_local: Dict[str, str] = {}
+
+    def rel_of(p: Path) -> str:
+        """相对路径，用于在提示里区分同名文件到底是哪两个。"""
+        if root is None:
+            return p.name
+        try:
+            return str(p.relative_to(root))
+        except ValueError:
+            return p.name
     items: List[Dict[str, Any]] = []
     for p in sorted(files, key=lambda x: str(x).lower()):
         kind = push_classify(p)
@@ -1337,12 +1346,14 @@ def build_push_plan(token: str, files: List[Path], space_id: str,
             item = _new_item(p, kind, size, "skip",
                              f"超过{KIND_CN[kind]}上限 {fmt_size(PUSH_LIMITS[kind])}")
         elif key in seen_local:
-            # 云端建不了文件夹，目录结构会被打平，重名必然撞车
+            # 云端建不了文件夹，目录结构会被打平，重名必然撞车。
+            # 提示里必须带上相对路径，否则「与 xxx 重名」会看着像撞自己。
             item = _new_item(p, kind, size, "skip",
-                             f"本地与「{seen_local[key]}」重名（上传后目录会打平）")
+                             f"与本地「{seen_local[key]}」重名（上传后目录会打平）")
         else:
-            seen_local[key] = p.name
+            seen_local[key] = rel_of(p)
             item = _judge_remote(token, p, kind, size, key, index)
+        item["rel"] = rel_of(p)
         items.append(item)
     return items
 
@@ -1424,7 +1435,7 @@ def render_push_plan(items: List[Dict[str, Any]], dest: str, top: int,
     if conflict and not overwrite:
         print("\n  以下文件云端已有同名，默认不传：")
         for i in conflict[:10]:
-            print(f"    - {cut(i['name'], 36)}  {i['reason']}")
+            print(f"    - {cut(i.get('rel') or i['name'], 40)}  {i['reason']}")
         if len(conflict) > 10:
             print(f"    ... 还有 {len(conflict) - 10} 个")
         print("    确认要覆盖就加 --overwrite。")
@@ -1432,7 +1443,7 @@ def render_push_plan(items: List[Dict[str, Any]], dest: str, top: int,
     if skip:
         print("\n  以下文件不会上传：")
         for i in skip[:10]:
-            print(f"    - {cut(i['name'], 36)}  {i['reason']}")
+            print(f"    - {cut(i.get('rel') or i['name'], 40)}  {i['reason']}")
         if len(skip) > 10:
             print(f"    ... 还有 {len(skip) - 10} 个")
 
@@ -1477,7 +1488,7 @@ def run_push(token: str, args: argparse.Namespace) -> int:
         print(f"[提示] {root} 里没有可上传的文件。")
         return 0
 
-    items = build_push_plan(token, files, space_id, parent_id)
+    items = build_push_plan(token, files, space_id, parent_id, root)
     summary = render_push_plan(items, dest, args.top, args.overwrite)
 
     if args.push_plan_only or args.dry_run:
