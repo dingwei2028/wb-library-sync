@@ -1,0 +1,9 @@
+# 短时凭证：30 分钟过期，但仍是账号凭证，绝不能进仓库
+token.txt
+*.token
+
+# 局部输出
+out/
+.DS_Store
+__pycache__/
+*.pyc

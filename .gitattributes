@@ -1,0 +1,9 @@
+# Windows 批处理必须是 CRLF 行尾，否则 cmd.exe 找不到 goto 标签、双击直接闪退
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.py  text eol=lf
+*.md  text eol=lf
+*.ps1 text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
