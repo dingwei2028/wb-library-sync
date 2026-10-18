@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zk.py —— 资料库一键导出到本地（WorkBuddy 资料库 → 本地目录）
+wblib.py —— 资料库本地同步（WorkBuddy 资料库 <-> 本地目录）
 
-设计要点
+两条链路
 --------
-1. 复用官方 library skill 的 `_common.py` 作为鉴权与 HTTP 层，不重复造轮子，
-   也不会把 token 写进任何文件或环境变量（token 只走 stdin 首行）。
-2. 递归遍历目录树（list-node 支持 parentNodeId，逐层下钻）。
-3. 按节点 kind 分发到正确的取内容通道：
-       drive / smh -> get-drive-file 拿预签名 URL -> 直拉字节
-       web / page -> list-page-artifacts 拿产物清单 -> 逐个 GET
-       doc        -> get-doc-review 拿正文
-       database   -> get-database-content 取表数据
-       link       -> 只记录原链接（正文需联网抓取，默认不抓）
-       目录       -> 在本地重建同名文件夹
-4. 全程只读，不碰任何写接口。
+【下载】云端 → 本地（默认，只读）
+   1. 复用官方 library skill 的 `_common.py` 作为鉴权与 HTTP 层，不重复造轮子，
+      也不会把 token 写进任何文件或环境变量（token 只走 stdin 首行）。
+   2. 递归遍历目录树（list-node 支持 parentNodeId，逐层下钻）。
+   3. 按节点 kind 分发到正确的取内容通道：
+          drive / smh -> get-drive-file 拿预签名 URL -> 直拉字节
+          web / page -> list-page-artifacts 拿产物清单 -> 逐个 GET
+          doc        -> get-doc-review 拿正文
+          database   -> get-database-content 取表数据
+          link       -> 只记录原链接（正文需联网抓取，默认不抓）
+          目录       -> 在本地重建同名文件夹
+   4. 只调 list-* / get-* 接口，不碰任何写接口。
+
+【上传】本地 → 云端（--push，会写入）
+   1. 收集本地文件，按扩展名路由：
+          .md            -> create-doc（直接建文档，不过 COS）
+          .html/.htm/.zip -> get-upload-credential -> PUT -> import-local-file（page）
+          .csv/.tsv       -> 同上（database）
+          其它           -> 同上（drive）
+   2. 凭证键按类型区分：drive 用 confirmKey，page/csv 用 cosKey。
+   3. 云端没有「建文件夹」的接口，所以目录结构上传后会被打平；
+      本地重名文件不会上传，避免撞车。
+   4. 团队空间默认拒绝写入，必须显式 --allow-team 才提交。
 
 用法
 ----
@@ -110,7 +122,7 @@ API_DOC_REVIEW = "/space/api/agent/v1/get-doc-review"
 API_PAGE_ARTIFACTS = "/space/api/agent/v1/list-page-artifacts"
 API_DB_CONTENT = "/space/api/agent/v1/get-database-content"
 
-USER_AGENT = "ziliaokudl/1.0 (+local backup tool)"
+USER_AGENT = "wb-library-sync/1.0 (+local sync tool)"
 
 
 class TooLarge(RuntimeError):
@@ -1120,10 +1132,429 @@ def _safe_fetch(handler, token, node, dest_dir, max_bytes) -> Dict[str, Any]:
         return {"status": "failed", "reason": str(exc)[:300]}
 
 
+# ================================================================ 上传（本地 → 云端）
+
+API_UPLOAD_CRED = "/space/api/agent/v1/get-upload-credential"
+API_IMPORT_FILE = "/space/api/agent/v1/import-local-file"
+API_CREATE_DOC = "/space/api/agent/v1/create-doc"
+
+EXT_DOC = {".md", ".markdown"}
+EXT_PAGE = {".html", ".htm", ".zip"}
+EXT_CSV = {".csv", ".tsv"}
+
+# 各类单文件上限，与官方模块保持一致
+PUSH_LIMITS = {
+    "doc": 50 * 1024 * 1024,
+    "page": 50 * 1024 * 1024,
+    "csv": 50 * 1024 * 1024,
+    "drive": 100 * 1024 * 1024,
+}
+KIND_CN = {"doc": "文档", "page": "页面", "csv": "数据表", "drive": "网盘文件"}
+
+PUSH_SKIP_NAMES = {"_manifest.json", ".ds_store", "thumbs.db", "desktop.ini"}
+PUSH_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".svn",
+                   ".workbuddy", ".venv", ".idea", ".cache"}
+# .lnk/.url 是快捷方式，传上去是个指向你本机的空壳，没意义
+PUSH_SKIP_EXT = {".tmp", ".part", ".crdownload", ".pyc", ".lnk", ".url"}
+
+
+def push_classify(p: Path) -> str:
+    """按扩展名决定走哪条写入通道。"""
+    ext = p.suffix.lower()
+    if ext in EXT_DOC:
+        return "doc"
+    if ext in EXT_PAGE:
+        return "page"
+    if ext in EXT_CSV:
+        return "csv"
+    return "drive"
+
+
+def collect_local_files(root: Path) -> List[Path]:
+    """收集待上传文件。目录递归，但只取文件——云端没有建文件夹的接口。"""
+    if root.is_file():
+        return [root]
+    out: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d.lower() not in PUSH_SKIP_DIRS)
+        for fn in sorted(filenames):
+            low = fn.lower()
+            if low in PUSH_SKIP_NAMES or low.startswith(".") or low.startswith("~$"):
+                continue
+            if Path(fn).suffix.lower() in PUSH_SKIP_EXT:
+                continue
+            out.append(Path(dirpath) / fn)
+    return out
+
+
+def _norm(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def _strip_ext(name: str) -> str:
+    """去掉已知扩展名。云端节点的 title 有时带扩展名、有时不带，两边都要能匹配上。"""
+    if not name:
+        return ""
+    low = name.lower()
+    for ext in sorted(EXT_DOC | EXT_PAGE | EXT_CSV, key=len, reverse=True):
+        if low.endswith(ext):
+            return name[: -len(ext)]
+    return os.path.splitext(name)[0]
+
+
+def remote_name_index(token: str, space_id: str, parent_id: str) -> Dict[str, List[Dict[str, Any]]]:
+    """列目标层级现有节点，按名称索引，供同名对账。"""
+    idx: Dict[str, List[Dict[str, Any]]] = {}
+    if not space_id:
+        return idx
+    try:
+        nodes = list_children(token, space_id, parent_id)
+    except Exception:
+        return idx
+    for nd in nodes:
+        t = _norm(nd.get("title"))
+        for key in {t, _strip_ext(t)}:
+            if key:
+                idx.setdefault(key, []).append(nd)
+    return idx
+
+
+def remote_node_size(token: str, node: Dict[str, Any]) -> Optional[int]:
+    """问某个云端节点多大。
+
+    drive/smh 有下载直链，就用下载侧那套 `Range: bytes=0-0` 判据；
+    doc/page/database 没有可探大小的直链，返回 None——按「未知」处理，
+    宁可重传一次，也不做「猜它一样」的乐观假设。
+    """
+    if _norm(node.get("kind")) not in {"drive", "smh"}:
+        return None
+    try:
+        data = api_post(API_DRIVE_FILE, {"nodeId": node["id"]}, token,
+                        timeout=15.0, tries=1)
+        url = (data.get("downloadUrl") or "").strip()
+        if url:
+            return http_probe_size(url)
+    except Exception:
+        pass
+    return None
+
+
+def _put_bytes(url: str, body: bytes, headers: Dict[str, str]) -> None:
+    req = urllib.request.Request(_safe_url(url), data=body, headers=headers, method="PUT")
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        if not (200 <= resp.status < 300):
+            raise RuntimeError(f"PUT 返回 HTTP {resp.status}")
+
+
+def push_via_import(token: str, path: Path, space_id: str, parent_id: str,
+                    file_name: str, target_node: str = "") -> Dict[str, Any]:
+    """drive / page / csv 共用 get-upload-credential → PUT → import-local-file。
+
+    三条路的差别只在凭证键：drive 用 confirmKey（PUT 要带签名头），
+    page 与 csv 用 cosKey（裸 PUT）。键名搞混会在 import 环节报空凭证。
+    """
+    size = path.stat().st_size
+    with open(path, "rb") as f:
+        body = f.read()
+
+    cred_body: Dict[str, Any] = {"fileName": file_name, "fileSize": size}
+    if parent_id or space_id:
+        cred_body["parentId"] = parent_id or space_id
+    cred = api_post(API_UPLOAD_CRED, cred_body, token, timeout=20.0, tries=1)
+
+    upload_url = (cred.get("uploadUrl") or "").strip()
+    if not upload_url:
+        raise RuntimeError("服务端未给出上传地址（当前账号可能未开放上传）")
+    raw_headers = cred.get("headers")
+    headers = {str(k): str(v) for k, v in raw_headers.items()} if isinstance(raw_headers, dict) else {}
+    confirm_key = (cred.get("confirmKey") or "").strip()
+    cos_key = (cred.get("cosKey") or "").strip()
+    task_id = (cred.get("taskId") or "").strip()
+    up_type = _norm(cred.get("uploadType"))
+
+    _put_bytes(upload_url, body, headers)
+
+    if confirm_key:                      # drive 通道
+        imp: Dict[str, Any] = {"confirmKey": confirm_key,
+                               "fileName": file_name, "fileSize": size}
+    else:                                 # page / csv 通道
+        if not cos_key:
+            raise RuntimeError("服务端未给出 cosKey")
+        imp = {"cosKey": cos_key, "fileName": file_name}
+    if task_id:
+        imp["taskId"] = task_id
+    if space_id:
+        imp["spaceId"] = space_id
+    if parent_id:
+        imp["parentId"] = parent_id
+    # 传了目标节点 = 覆盖该节点内容（只有 drive 支持，doc/page/csv 只能新建）
+    if target_node:
+        imp["nodeBlockId"] = target_node
+    title = os.path.splitext(file_name)[0].strip()
+    if title:
+        imp["title"] = title
+
+    res = api_post(API_IMPORT_FILE, imp, token, timeout=60.0, tries=1)
+    nid = (res.get("nodeBlockId") or res.get("nodeId") or "").strip()
+    if not nid:
+        raise RuntimeError("服务端未返回 nodeBlockId")
+    return {"node": nid, "url": (res.get("url") or "").strip(), "upload_type": up_type}
+
+
+def push_via_doc(token: str, path: Path, space_id: str, parent_id: str,
+                 title: str) -> Dict[str, Any]:
+    """.md 直接建文档，不走 COS。"""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    body: Dict[str, Any] = {"title": title, "markdown": text}
+    if space_id:
+        body["spaceId"] = space_id
+    if parent_id:
+        body["parentId"] = parent_id
+    res = api_post(API_CREATE_DOC, body, token, timeout=60.0, tries=1)
+    nid = (res.get("nodeBlockId") or res.get("nodeId") or "").strip()
+    if not nid:
+        raise RuntimeError("服务端未返回 nodeBlockId")
+    return {"node": nid, "url": (res.get("url") or f"/space/d/{nid}"), "upload_type": "doc"}
+
+
+def build_push_plan(token: str, files: List[Path], space_id: str,
+                    parent_id: str) -> List[Dict[str, Any]]:
+    """逐个文件判定：上传 / 云端已有（跳过）/ 不能传（跳过）。"""
+    index = remote_name_index(token, space_id, parent_id)
+    seen_local: Dict[str, str] = {}
+    items: List[Dict[str, Any]] = []
+    for p in sorted(files, key=lambda x: str(x).lower()):
+        kind = push_classify(p)
+        try:
+            size = p.stat().st_size
+        except OSError:
+            size = 0
+        key = _norm(p.name)
+
+        if size == 0:
+            item = _new_item(p, kind, size, "skip", "空文件")
+        elif size > PUSH_LIMITS[kind]:
+            item = _new_item(p, kind, size, "skip",
+                             f"超过{KIND_CN[kind]}上限 {fmt_size(PUSH_LIMITS[kind])}")
+        elif key in seen_local:
+            # 云端建不了文件夹，目录结构会被打平，重名必然撞车
+            item = _new_item(p, kind, size, "skip",
+                             f"本地与「{seen_local[key]}」重名（上传后目录会打平）")
+        else:
+            seen_local[key] = p.name
+            item = _judge_remote(token, p, kind, size, key, index)
+        items.append(item)
+    return items
+
+
+def _new_item(p: Path, kind: str, size: int, state: str, reason: str) -> Dict[str, Any]:
+    return {"path": p, "name": p.name, "kind": kind, "size": size,
+            "state": state, "reason": reason, "target": ""}
+
+
+def _judge_remote(token: str, p: Path, kind: str, size: int, key: str,
+                  index: Dict[str, List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    """和云端同名节点对账，决定这一个文件怎么处理。
+
+    四态：
+        upload    云端没有同名 → 直接传
+        same      同名且大小一致 → 跳过（幂等，与下载侧同一判据）
+        conflict  同名但大小不同，或该类压根探不到大小 → 默认跳过，
+                  因为官方没有删除接口，制造重复节点是没办法收拾的
+        （不能上传的那些在调用方就判掉了）
+
+    只有 drive 能原地替换内容（靠 nodeBlockId）；doc/page/csv 的 --overwrite
+    会再建一份，这点在提示里说清楚，不藏着。
+    """
+    cands = index.get(key) or index.get(_strip_ext(key)) or []
+    item = _new_item(p, kind, size, "upload", "")
+    if not cands:
+        return item
+    for nd in cands:
+        rs = remote_node_size(token, nd)
+        if rs is not None and rs == size:
+            item["state"] = "same"
+            item["reason"] = "云端已有同名且大小一致"
+            return item
+    # 走到这里：要么大小对不上，要么这一类探不到大小
+    item["state"] = "conflict"
+    item["target"] = (cands[0].get("id") or "").strip()
+    if kind == "drive":
+        item["reason"] = "云端已有同名但大小不同；--overwrite 可原地替换内容"
+    else:
+        item["reason"] = "云端已有同名（此类无法比对大小）；--overwrite 会再建一份"
+    return item
+
+
+def render_push_plan(items: List[Dict[str, Any]], dest: str, top: int,
+                     overwrite: bool = False) -> Dict[str, Any]:
+    up = [i for i in items if i["state"] == "upload"]
+    same = [i for i in items if i["state"] == "same"]
+    conflict = [i for i in items if i["state"] == "conflict"]
+    skip = [i for i in items if i["state"] == "skip"]
+    # --overwrite 时冲突项也纳入上传，否则一律跳过
+    will = up + (conflict if overwrite else [])
+    total = sum(i["size"] for i in will)
+
+    print("\n" + "=" * 64)
+    print("  上传计划")
+    print("=" * 64)
+    print(f"  目标位置        {dest}")
+    print(f"  选中文件        {len(items)} 个")
+    if same:
+        print(f"  云端已有        {len(same)} 个   同名且大小一致，跳过")
+    if conflict:
+        tag = "会原地替换内容" if overwrite else "默认跳过（官方没有删除接口，不制造重复）"
+        print(f"  名字撞车        {len(conflict)} 个   {tag}")
+    if skip:
+        print(f"  不能上传        {len(skip)} 个")
+    print("  " + "-" * 60)
+    print(f"  ** 待上传 **      {len(will)} 个   {fmt_size(total)}")
+    print("=" * 64)
+
+    if will:
+        print(f"\n  待上传清单（按大小，前 {min(top, len(will))}/{len(will)} 个）：\n")
+        print("            大小  类型        文件")
+        print("  " + "-" * 60)
+        for i in sorted(will, key=lambda x: -x["size"])[:top]:
+            print(f"  {fmt_size(i['size']):>10}  {KIND_CN[i['kind']]:<8}  {cut(i['name'], 40)}")
+        if len(will) > top:
+            print(f"  ... 还有 {len(will) - top} 个")
+
+    if conflict and not overwrite:
+        print("\n  以下文件云端已有同名，默认不传：")
+        for i in conflict[:10]:
+            print(f"    - {cut(i['name'], 36)}  {i['reason']}")
+        if len(conflict) > 10:
+            print(f"    ... 还有 {len(conflict) - 10} 个")
+        print("    确认要覆盖就加 --overwrite。")
+
+    if skip:
+        print("\n  以下文件不会上传：")
+        for i in skip[:10]:
+            print(f"    - {cut(i['name'], 36)}  {i['reason']}")
+        if len(skip) > 10:
+            print(f"    ... 还有 {len(skip) - 10} 个")
+
+    return {"upload": len(will), "bytes": total, "same": len(same),
+            "conflict": len(conflict), "skip": len(skip)}
+
+
+def run_push(token: str, args: argparse.Namespace) -> int:
+    root = Path(args.push).expanduser()
+    if not root.exists():
+        print(f"[错误] 路径不存在：{root}")
+        return 2
+
+    space_id = (args.space_id or "").strip()
+    parent_id = (args.parent_id or "").strip()
+
+    dest = "我的文档（未指定空间，由服务端落到个人空间）"
+    if space_id:
+        try:
+            spaces = list_spaces(token)
+        except Exception as exc:
+            print(f"[错误] 列空间失败: {exc}")
+            return 3
+        space = next((s for s in spaces if s.get("spaceId") == space_id), None)
+        if space is None:
+            print(f"[错误] 找不到空间 {space_id}")
+            return 4
+        role = _norm(space.get("role"))
+        if role in {"reader", "invalid"}:
+            print(f"[错误] 你在该空间的角色是 {role}，没有写入权限。")
+            return 5
+        # 团队空间写入必须先展示方案并得到确认——这是硬规矩，不在代码里绕过
+        if _norm(space.get("category")) == "team" and not args.allow_team:
+            print(f"[中止] 目标「{space.get('title') or space_id}」是团队空间。")
+            print("       写入团队空间前必须先看清方案并确认。")
+            print("       确认后请加 --allow-team 再执行。")
+            return 6
+        dest = f"{space.get('title') or '我的文档'}（{space_id}）"
+
+    files = collect_local_files(root)
+    if not files:
+        print(f"[提示] {root} 里没有可上传的文件。")
+        return 0
+
+    items = build_push_plan(token, files, space_id, parent_id)
+    summary = render_push_plan(items, dest, args.top, args.overwrite)
+
+    if args.push_plan_only or args.dry_run:
+        print("\n  [报表结束，未上传任何文件]")
+        print(f"  待上传：{summary['upload']} 个")
+        return 0
+
+    if not summary["upload"]:
+        print("\n  无需上传，已退出。")
+        return 0
+
+    if not args.yes:
+        print(f"\n  即将上传 {summary['upload']} 个文件"
+              f"（约 {fmt_size(summary['bytes'])}）到：{dest}")
+        if not ask_yes_no("  要上传吗？[Y/n] "):
+            print("\n  已取消，没有上传任何文件。")
+            return 0
+        print()
+
+    ok = failed = 0
+    started = time.time()
+    results: List[Dict[str, Any]] = []
+    for it in items:
+        if it["state"] == "conflict":
+            if not args.overwrite:
+                continue
+            # 只有 drive 能原地替换；doc/page/csv 只能新建，会多出一份
+            target = it["target"] if it["kind"] == "drive" else ""
+        elif it["state"] != "upload":
+            continue
+        else:
+            target = ""
+        try:
+            if it["kind"] == "doc":
+                r = push_via_doc(token, it["path"], space_id, parent_id,
+                                 _strip_ext(it["name"]) or it["name"])
+            else:
+                r = push_via_import(token, it["path"], space_id, parent_id,
+                                    it["name"], target)
+            ok += 1
+            results.append({"name": it["name"], "kind": it["kind"],
+                            "size": it["size"], "node": r["node"], "url": r["url"],
+                            "status": "ok"})
+            print(f"  ✓ {cut(it['name'], 34):<34} {KIND_CN[it['kind']]}  {fmt_size(it['size']):>9}")
+        except Exception as exc:
+            failed += 1
+            results.append({"name": it["name"], "kind": it["kind"],
+                            "size": it["size"], "status": "failed", "reason": str(exc)})
+            print(f"  ✗ {cut(it['name'], 34):<34} {exc}")
+
+    print("\n" + "=" * 64)
+    print(f"完成：上传成功 {ok}，"
+          f"跳过 {summary['same'] + summary['conflict'] + summary['skip']}"
+          f"（云端已有 {summary['same']}、撞车 {summary['conflict']}、不能传 {summary['skip']}），"
+          f"失败 {failed}，用时 {time.time() - started:.1f}s")
+    if failed:
+        print("\n失败明细：")
+        for r in results:
+            if r["status"] == "failed":
+                print(f"  - {r['name']}: {r['reason']}")
+    if ok and results:
+        sample = next((r for r in results if r["status"] == "ok" and r.get("url")), None)
+        if sample:
+            print(f"\n例：{sample['name']} → {sample['url']}")
+    return 0
+
+
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="资料库一键导出到本地",
+        description="资料库本地同步：下载（云端→本地）与上传（本地→云端）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "上传示例：\n"
+            "  wblib.py --push D:\\backup\\需求文档\n"
+            "  wblib.py --push D:\\backup\\需求文档 --space-id <id>\n"
+            "  wblib.py --push ./report.csv --dry-run\n"
+        ),
     )
     p.add_argument("--out", default=str(DEFAULT_OUT),
                    help=f"输出根目录。默认 {DEFAULT_OUT}")
@@ -1155,6 +1586,16 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="连团队空间一起导。默认只导你自己创建的（owner）空间，"
                         "因为别人的团队空间往往有几百个用不上的示例资源文件")
     p.add_argument("--no-manifest", action="store_true", help="不写 _manifest.json")
+
+    # ---- 上传（本地 → 云端）----
+    p.add_argument("--push", default="",
+                   help="上传本地文件或目录到资料库。目录会被递归展开（云端建不了文件夹）")
+    p.add_argument("--parent-id", default="",
+                   help="上传目标目录节点，须与 --space-id 同属一个空间")
+    p.add_argument("--allow-team", action="store_true",
+                   help="确认后允许写入团队空间。默认是拒绝，避免误动别人的库")
+    p.add_argument("--push-plan-only", action="store_true", help=argparse.SUPPRESS)
+
     p.add_argument("--library-path", default="", help="显式指定 library skill 目录")
     p.add_argument("--token-stdin", action="store_true", default=True,
                    help=argparse.SUPPRESS)
@@ -1176,6 +1617,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("[错误] 未拿到 token。请由上层 agent 先调 connect_open_platform，"
               "再把 token 从 stdin 首行传入。", file=sys.stderr)
         return 2
+
+    # 上传与下载是两条互斥的链路，拿到 token 后就分道
+    if args.push:
+        return run_push(token, args)
 
     account = (args.account or detect_account()).strip() or "default"
     out_root = Path(args.out).expanduser().resolve() / safe_name(account)
