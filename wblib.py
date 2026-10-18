@@ -1503,6 +1503,37 @@ def resolve_target_space(token: str, space_id: str, allow_team: bool
     return space, f"{space.get('title') or '我的文档'}（{space_id}）", 0
 
 
+def _kw_list(s: str) -> List[str]:
+    """把「a,b，c」拆成关键词列表（中英文逗号都认）。"""
+    return [x.strip() for x in (s or "").replace("，", ",").split(",") if x.strip()]
+
+
+def _kw_hit(name: str, kws: List[str]) -> bool:
+    """名称是否命中任一关键词（不区分大小写，子串匹配）。"""
+    if not kws:
+        return False
+    low = (name or "").lower()
+    return any(k.lower() in low for k in kws)
+
+
+def _pick_set(s: str) -> set:
+    """把「1,3,5-8」解析成序号集合，用于 --mark-pick。"""
+    out: set = set()
+    for raw in (s or "").replace("，", ",").split(","):
+        x = raw.strip()
+        if not x:
+            continue
+        if x.isdigit():
+            out.add(int(x))
+        elif "-" in x:
+            a, b = x.split("-", 1)
+            if a.strip().isdigit() and b.strip().isdigit():
+                lo, hi = int(a), int(b)
+                if lo <= hi:
+                    out.update(range(lo, hi + 1))
+    return out
+
+
 def run_mark_delete(token: str, args: argparse.Namespace) -> int:
     """给节点改名打标（或撤销标记）。
 
@@ -1518,9 +1549,14 @@ def run_mark_delete(token: str, args: argparse.Namespace) -> int:
     prefix = (args.mark_prefix or MARK_PREFIX).strip() or MARK_PREFIX
     undo = bool(args.mark_undo)
 
+    only = _kw_list(args.mark_only)
+    keep = _kw_list(args.mark_keep)
+    picks = _pick_set(args.mark_pick)
+
     nodes = walk_space(token, space["spaceId"], max_depth=args.max_depth)
     plan: List[Dict[str, Any]] = []
-    for n in nodes:
+    held: List[Dict[str, Any]] = []
+    for idx, n in enumerate(nodes, 1):
         title = (n.get("title") or "").strip()
         nid = (n.get("id") or "").strip()
         if not title or not nid:
@@ -1530,9 +1566,21 @@ def run_mark_delete(token: str, args: argparse.Namespace) -> int:
         else:
             new = "" if title.startswith(prefix) else prefix + title
         if not new or new == title:
-            continue
-        plan.append({"id": nid, "old": title, "new": new,
-                     "kind": _norm(n.get("kind")) or "?"})
+            continue          # 已经是目标状态，不用管
+        row = {"no": idx, "id": nid, "old": title, "new": new,
+               "kind": _norm(n.get("kind")) or "?"}
+        reason = ""
+        if only and not _kw_hit(title, only):
+            reason = "不在 --mark-only 范围内"
+        elif _kw_hit(title, keep):
+            reason = "命中 --mark-keep，保留不动"
+        elif picks and idx not in picks:
+            reason = "未被 --mark-pick 选中"
+        if reason:
+            row["reason"] = reason
+            held.append(row)
+        else:
+            plan.append(row)
 
     print("\n" + "=" * 64)
     print(f"  {'撤销标记' if undo else '打删除标记'}")
@@ -1540,16 +1588,32 @@ def run_mark_delete(token: str, args: argparse.Namespace) -> int:
     print(f"  目标空间        {dest}")
     print(f"  节点总数        {len(nodes)} 个")
     print(f"  本次改名        {len(plan)} 个")
+    if held:
+        print(f"  本次跳过        {len(held)} 个（被过滤条件拦下）")
     print(f"  前缀            {prefix}")
+    if only:
+        print(f"  只处理含        {' / '.join(only)}")
+    if keep:
+        print(f"  保留含          {' / '.join(keep)}")
+    if picks:
+        print(f"  只处理序号      {','.join(str(x) for x in sorted(picks))}")
     print("=" * 64)
     if plan:
-        print(f"\n  改名清单（前 {min(args.top, len(plan))}/{len(plan)} 个）：\n")
-        print("  类型        原名称 → 新名称")
-        print("  " + "-" * 60)
+        print(f"\n  将改名（前 {min(args.top, len(plan))}/{len(plan)} 个）：\n")
+        print("  #     类型        原名称 → 新名称")
+        print("  " + "-" * 62)
         for i in plan[:args.top]:
-            print(f"  {i['kind']:<10}  {cut(i['old'], 26)} → {cut(i['new'], 30)}")
+            print(f"  #{i['no']:<4} {i['kind']:<10}  "
+                  f"{cut(i['old'], 24)} → {cut(i['new'], 28)}")
         if len(plan) > args.top:
             print(f"  ... 还有 {len(plan) - args.top} 个")
+    if held:
+        print(f"\n  跳过不动（{len(held)} 个）：\n")
+        for i in held[:args.top]:
+            print(f"  #{i['no']:<4} {i['kind']:<10}  "
+                  f"{cut(i['old'], 28)}   <- {i['reason']}")
+        if len(held) > args.top:
+            print(f"  ... 还有 {len(held) - args.top} 个")
 
     if args.dry_run:
         print("\n  [预览结束，未做任何修改]")
@@ -1574,15 +1638,17 @@ def run_mark_delete(token: str, args: argparse.Namespace) -> int:
             api_post(API_RENAME_NODE, {"nodeId": i["id"], "title": i["new"]},
                      token, timeout=20.0, tries=1)
             ok += 1
-            print(f"  ✓ {cut(i['new'], 44)}")
+            print(f"  ✓ #{i['no']:<4} {cut(i['new'], 44)}")
         except Exception as exc:
             failed += 1
-            print(f"  ✗ {cut(i['old'], 30)}: {exc}")
+            print(f"  ✗ #{i['no']:<4} {cut(i['old'], 30)}: {exc}")
 
     print("\n" + "=" * 64)
     print(f"完成：改名 {ok} 个，失败 {failed} 个")
-    if ok:
-        print(f"\n现在去网页搜索框搜「{prefix}」，这 {ok} 个会一次全出来。")
+    if ok and not undo:
+        print(f"\n现在去网页搜索框搜「{prefix}」，带这个前缀的会一次全出来。")
+    elif ok:
+        print(f"\n标记已撤销，名字恢复原样，内容没动过。")
     return 0
 
 
@@ -1733,6 +1799,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="去掉 --mark-delete 加的前缀（撤销，不丢内容）")
     p.add_argument("--mark-prefix", default=MARK_PREFIX,
                    help=f"标记前缀，默认 {MARK_PREFIX}")
+    p.add_argument("--mark-only", default="",
+                   help="只处理名称含这些关键词的节点，逗号分隔，如 --mark-only 过来人,歌词")
+    p.add_argument("--mark-keep", default="",
+                   help="跳过名称含这些关键词的节点（本次不动它们），逗号分隔")
+    p.add_argument("--mark-pick", default="",
+                   help="只处理清单里的这些序号，逗号分隔，序号见干跑打印的 #1 #2 ...")
 
     p.add_argument("--library-path", default="", help="显式指定 library skill 目录")
     p.add_argument("--token-stdin", action="store_true", default=True,

@@ -145,7 +145,52 @@ wblib.py --push ./folder --dry-run                         :: 只出计划，不
 
 ---
 
-## 四、参数
+## 四、删除：官方没接口，只能用打标代替
+
+**先说结论：不管是你自己的还是团队的，文件/文件夹节点一个都删不掉。**
+不是权限不够，是 WorkBuddy 资料库**压根没开放节点删除的 Agent 接口**
+（官方 `mutation.md` 原文：「文件/文件夹节点删除没有正式 Agent API」）。
+真正能删的只有三类：文档正文的块、数据表的字段、数据表的记录。
+
+所以「一键删除」这条路是死的。退而求其次的办法是**改名打标**：
+
+```bash
+python wblib.py --mark-delete          # 给节点名加【待删】前缀
+python wblib.py --mark-delete --yes    # 不问直接打
+python wblib.py --mark-undo   --yes    # 撤销，名字恢复原样
+```
+
+打完标去网页搜索框搜 `【待删】`，要删的一次全出来，不用在几十上百条里翻。
+改名可逆、不丢内容，所以可以放心先打标，再慢慢挑。
+
+### 只想动其中几个？三个过滤器
+
+| 参数 | 作用 | 例子 |
+|---|---|---|
+| `--mark-only 关键词` | **只处理**名称含这些词的 | `--mark-only 过来人,歌词` |
+| `--mark-keep 关键词` | **跳过**名称含这些词的（保留不动） | `--mark-keep 歌词` |
+| `--mark-pick 序号` | **只处理**清单里这些 `#N` | `--mark-pick 1,3,5-8` |
+
+序号就是干跑打印里每行开头的 `#1` `#2`，支持 `5-8` 这种区间。
+三个可以叠加，中英文逗号都认。动手前一律先 `--dry-run` 看一眼：
+
+```bash
+python wblib.py --mark-delete --dry-run --mark-keep 歌词   # 先预览谁会被跳过
+python wblib.py --mark-undo   --dry-run --mark-pick 1-3    # 只还原前三个
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--mark-delete` | — | 加前缀打标 |
+| `--mark-undo` | — | 去掉前缀撤销 |
+| `--mark-prefix` | `【待删】` | 自定义前缀 |
+| `--mark-only` / `--mark-keep` / `--mark-pick` | — | 上面那三个过滤器 |
+| `--dry-run` | — | 只看清单不改名 |
+| `--allow-team` | 关 | 打标默认只进个人空间，团队空间要显式确认 |
+
+---
+
+## 五、参数
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -323,7 +368,7 @@ wblib.py --max-size 200               :: 单文件超过 200MB 就跳过
 
 ---
 
-## 五、按节点类型怎么取的
+## 六、按节点类型怎么取的
 
 不同类型的节点，走的接口完全不同：
 
@@ -341,7 +386,7 @@ wblib.py --max-size 200               :: 单文件超过 200MB 就跳过
 
 ---
 
-## 六、目录结构
+## 七、目录结构
 
 第一层是**账户 uid**——同一个 WorkBuddy 可以登多个账号，分开存不会互相覆盖：
 
@@ -364,7 +409,7 @@ Downloads\WbLib.cn\
 
 ---
 
-## 七、踩过的坑 & 解决
+## 八、踩过的坑 & 解决
 
 ### 1. 中文文件名导致页面静默丢失（最隐蔽）
 
@@ -447,7 +492,7 @@ UnicodeEncodeError: 'latin-1' codec can't encode character '\ufeff'
 
 ---
 
-## 八、安全边界
+## 九、安全边界
 
 **下载链路是只读的**，上传链路会写入：
 
@@ -470,7 +515,7 @@ UnicodeEncodeError: 'latin-1' codec can't encode character '\ufeff'
 
 ---
 
-## 九、文件清单
+## 十、文件清单
 
 ```
 wb-library-sync/
@@ -488,7 +533,7 @@ wb-library-sync/
 > `.gitignore` 已经写好了 `token.txt` / `*.token`，但不保险 ——
 > **push 之前先 `git status` 扫一眼**，确认没有 `token.txt` 被跟踪。
 
-## 十、数字说明（避免误会）
+## 十一、数字说明（避免误会）
 
 最后一次全量实测：
 
