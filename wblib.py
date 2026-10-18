@@ -1137,6 +1137,9 @@ def _safe_fetch(handler, token, node, dest_dir, max_bytes) -> Dict[str, Any]:
 API_UPLOAD_CRED = "/space/api/agent/v1/get-upload-credential"
 API_IMPORT_FILE = "/space/api/agent/v1/import-local-file"
 API_CREATE_DOC = "/space/api/agent/v1/create-doc"
+API_RENAME_NODE = "/space/api/agent/v1/rename-node"
+
+MARK_PREFIX = "【待删】"
 
 EXT_DOC = {".md", ".markdown"}
 EXT_PAGE = {".html", ".htm", ".zip"}
@@ -1451,6 +1454,138 @@ def render_push_plan(items: List[Dict[str, Any]], dest: str, top: int,
             "conflict": len(conflict), "skip": len(skip)}
 
 
+def resolve_target_space(token: str, space_id: str, allow_team: bool
+                         ) -> Tuple[Optional[Dict[str, Any]], str, int]:
+    """解析写入目标空间。返回 (space|None, dest_label, err_code)。
+
+    err_code 为 0 表示可以继续；非 0 时调用方直接 return 该码。
+    三道闸都在这里：找不到空间 / 角色不可写 / 团队空间未确认。
+    不传 spaceId 时自动定位到个人空间（category=personal 且 role=owner）。
+    """
+    if not space_id:
+        try:
+            spaces = list_spaces(token)
+        except Exception as exc:
+            print(f"[错误] 列空间失败: {exc}")
+            return None, "", 3
+        own = [s for s in spaces
+               if _norm(s.get("category")) == "personal" and _norm(s.get("role")) == "owner"]
+        if len(own) == 1:
+            sp = own[0]
+            return sp, f"{sp.get('title') or '我的文档'}（{sp.get('spaceId')}）", 0
+        if not own:
+            print("[错误] 没找到你的个人空间，请用 --space-id 显式指定。")
+            return None, "", 4
+        print("[错误] 有多个个人空间，请用 --space-id 指定其中一个：")
+        for s in own:
+            print(f"       {s.get('spaceId')}  {s.get('title') or '(未命名)'}")
+        return None, "", 4
+
+    try:
+        spaces = list_spaces(token)
+    except Exception as exc:
+        print(f"[错误] 列空间失败: {exc}")
+        return None, "", 3
+    space = next((s for s in spaces if s.get("spaceId") == space_id), None)
+    if space is None:
+        print(f"[错误] 找不到空间 {space_id}")
+        return None, "", 4
+    role = _norm(space.get("role"))
+    if role in {"reader", "invalid"}:
+        print(f"[错误] 你在该空间的角色是 {role}，没有写入权限。")
+        return None, "", 5
+    # 团队空间写入必须先展示方案并得到确认——这是硬规矩，不在代码里绕过
+    if _norm(space.get("category")) == "team" and not allow_team:
+        print(f"[中止] 目标「{space.get('title') or space_id}」是团队空间。")
+        print("       写入团队空间前必须先看清方案并确认。")
+        print("       确认后请加 --allow-team 再执行。")
+        return None, "", 6
+    return space, f"{space.get('title') or '我的文档'}（{space_id}）", 0
+
+
+def run_mark_delete(token: str, args: argparse.Namespace) -> int:
+    """给节点改名打标（或撤销标记）。
+
+    官方没有节点删除接口，所以在网页里一个个删是唯一出路。
+    打标的作用是：改完在网页搜索框搜这个前缀，要删的一次全出来，
+    不用在几十上百个条目里翻。改名可逆、不丢内容。
+    """
+    space_id = (args.space_id or "").strip()
+    space, dest, code = resolve_target_space(token, space_id, args.allow_team)
+    if code:
+        return code
+
+    prefix = (args.mark_prefix or MARK_PREFIX).strip() or MARK_PREFIX
+    undo = bool(args.mark_undo)
+
+    nodes = walk_space(token, space["spaceId"], max_depth=args.max_depth)
+    plan: List[Dict[str, Any]] = []
+    for n in nodes:
+        title = (n.get("title") or "").strip()
+        nid = (n.get("id") or "").strip()
+        if not title or not nid:
+            continue
+        if undo:
+            new = title[len(prefix):].strip() if title.startswith(prefix) else ""
+        else:
+            new = "" if title.startswith(prefix) else prefix + title
+        if not new or new == title:
+            continue
+        plan.append({"id": nid, "old": title, "new": new,
+                     "kind": _norm(n.get("kind")) or "?"})
+
+    print("\n" + "=" * 64)
+    print(f"  {'撤销标记' if undo else '打删除标记'}")
+    print("=" * 64)
+    print(f"  目标空间        {dest}")
+    print(f"  节点总数        {len(nodes)} 个")
+    print(f"  本次改名        {len(plan)} 个")
+    print(f"  前缀            {prefix}")
+    print("=" * 64)
+    if plan:
+        print(f"\n  改名清单（前 {min(args.top, len(plan))}/{len(plan)} 个）：\n")
+        print("  类型        原名称 → 新名称")
+        print("  " + "-" * 60)
+        for i in plan[:args.top]:
+            print(f"  {i['kind']:<10}  {cut(i['old'], 26)} → {cut(i['new'], 30)}")
+        if len(plan) > args.top:
+            print(f"  ... 还有 {len(plan) - args.top} 个")
+
+    if args.dry_run:
+        print("\n  [预览结束，未做任何修改]")
+        print(f"  将会改：{len(plan)} 个")
+        return 0
+    if not plan:
+        print("\n  无需改名，已退出。")
+        return 0
+
+    if not args.yes:
+        word = "撤销" if undo else "打标"
+        print(f"\n  即将{word} {len(plan)} 个节点的名称。")
+        print(f"  （只是改名字，不动内容；随时可以用 --mark-undo 撤销）")
+        if not ask_yes_no("  要继续吗？[Y/n] "):
+            print("\n  已取消，没有改动任何节点。")
+            return 0
+        print()
+
+    ok = failed = 0
+    for i in plan:
+        try:
+            api_post(API_RENAME_NODE, {"nodeId": i["id"], "title": i["new"]},
+                     token, timeout=20.0, tries=1)
+            ok += 1
+            print(f"  ✓ {cut(i['new'], 44)}")
+        except Exception as exc:
+            failed += 1
+            print(f"  ✗ {cut(i['old'], 30)}: {exc}")
+
+    print("\n" + "=" * 64)
+    print(f"完成：改名 {ok} 个，失败 {failed} 个")
+    if ok:
+        print(f"\n现在去网页搜索框搜「{prefix}」，这 {ok} 个会一次全出来。")
+    return 0
+
+
 def run_push(token: str, args: argparse.Namespace) -> int:
     root = Path(args.push).expanduser()
     if not root.exists():
@@ -1460,28 +1595,12 @@ def run_push(token: str, args: argparse.Namespace) -> int:
     space_id = (args.space_id or "").strip()
     parent_id = (args.parent_id or "").strip()
 
-    dest = "我的文档（未指定空间，由服务端落到个人空间）"
-    if space_id:
-        try:
-            spaces = list_spaces(token)
-        except Exception as exc:
-            print(f"[错误] 列空间失败: {exc}")
-            return 3
-        space = next((s for s in spaces if s.get("spaceId") == space_id), None)
-        if space is None:
-            print(f"[错误] 找不到空间 {space_id}")
-            return 4
-        role = _norm(space.get("role"))
-        if role in {"reader", "invalid"}:
-            print(f"[错误] 你在该空间的角色是 {role}，没有写入权限。")
-            return 5
-        # 团队空间写入必须先展示方案并得到确认——这是硬规矩，不在代码里绕过
-        if _norm(space.get("category")) == "team" and not args.allow_team:
-            print(f"[中止] 目标「{space.get('title') or space_id}」是团队空间。")
-            print("       写入团队空间前必须先看清方案并确认。")
-            print("       确认后请加 --allow-team 再执行。")
-            return 6
-        dest = f"{space.get('title') or '我的文档'}（{space_id}）"
+    _space, dest, code = resolve_target_space(token, space_id, args.allow_team)
+    if code:
+        return code
+    # 解析成真实 spaceId：不指定时用个人空间的 id，
+    # 否则 remote_name_index 拿不到清单，上传侧就完全没了重复保护。
+    space_id = (_space or {}).get("spaceId") or ""
 
     files = collect_local_files(root)
     if not files:
@@ -1607,6 +1726,14 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="确认后允许写入团队空间。默认是拒绝，避免误动别人的库")
     p.add_argument("--push-plan-only", action="store_true", help=argparse.SUPPRESS)
 
+    # ---- 打标（官方没有删除接口，改名打标是在网页里批量找到它们的唯一办法）----
+    p.add_argument("--mark-delete", action="store_true",
+                   help="给节点改名加前缀，便于在网页搜索框一次搜出来删掉")
+    p.add_argument("--mark-undo", action="store_true",
+                   help="去掉 --mark-delete 加的前缀（撤销，不丢内容）")
+    p.add_argument("--mark-prefix", default=MARK_PREFIX,
+                   help=f"标记前缀，默认 {MARK_PREFIX}")
+
     p.add_argument("--library-path", default="", help="显式指定 library skill 目录")
     p.add_argument("--token-stdin", action="store_true", default=True,
                    help=argparse.SUPPRESS)
@@ -1632,6 +1759,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 上传与下载是两条互斥的链路，拿到 token 后就分道
     if args.push:
         return run_push(token, args)
+    if args.mark_delete or args.mark_undo:
+        return run_mark_delete(token, args)
 
     account = (args.account or detect_account()).strip() or "default"
     out_root = Path(args.out).expanduser().resolve() / safe_name(account)
